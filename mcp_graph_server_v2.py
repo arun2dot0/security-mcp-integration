@@ -240,6 +240,72 @@ def build_selection_for_entity(
 
     return "\n".join(render(tree))
 
+def get_entity_relations():
+    schema_data = get_security_schema()
+    entities = schema_data["entities"]
+
+    relation_map = {}
+
+    for entity_name, entity_info in entities.items():
+        relation_map[entity_name] = entity_info.get("relations", {})
+
+    return relation_map
+
+
+def validate_field_paths(entity: str, fields: List[str]) -> List[str]:
+    """
+    Remove invalid recursive/nonsensical field paths.
+    """
+
+    schema_data = get_security_schema()
+    entities = schema_data["entities"]
+
+    valid_fields = []
+
+    for field_path in fields:
+        parts = field_path.split(".")
+
+        current_entity = entity
+        valid = True
+
+        for i, part in enumerate(parts):
+
+            entity_info = entities.get(current_entity)
+            if not entity_info:
+                valid = False
+                break
+
+            is_last = i == len(parts) - 1
+
+            # scalar field
+            if part in entity_info.get("fields", {}):
+                if not is_last:
+                    valid = False
+                break
+
+            # relation field
+            elif part in entity_info.get("relations", {}):
+                relation_type = entity_info["relations"][part]
+
+                # convert "CVE[]" -> "CVE"
+                current_entity = relation_type.replace("[]", "")
+
+                if is_last:
+                    valid = False
+
+            else:
+                valid = False
+                break
+
+        if valid:
+            valid_fields.append(field_path)
+        else:
+            print(
+                f"Skipping invalid field path: {field_path}",
+                file=sys.stderr,
+            )
+
+    return valid_fields
 
 def build_filters_arguments(filters: Dict[str, Any]) -> (str, Dict[str, Any]):
     """
@@ -329,6 +395,7 @@ def query_security_graph(
         print("filters", filters, file=sys.stderr)
 
         # Build selection set
+        fields = validate_field_paths(entity, fields or [])
         selection = build_selection_for_entity(entity, fields)
         print("selection", selection, file=sys.stderr)
 
