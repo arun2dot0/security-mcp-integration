@@ -142,7 +142,7 @@ class Query:
     @strawberry.field
     def cves(
         self,
-        severity: Optional[str] = None,
+        severities: Optional[List[str]] = None,
         limit: int = 20,
         published_after: Optional[datetime] = None,
         published_before: Optional[datetime] = None,
@@ -150,10 +150,12 @@ class Query:
         with SessionLocal() as session:
             stmt = select(CVE)
 
-            if severity:
-                stmt = stmt.where(CVE.severity == severity)
+            if severities:
+                stmt = stmt.where(CVE.severity.in_(severities))
+
             if published_after:
                 stmt = stmt.where(CVE.published_at >= published_after)
+
             if published_before:
                 stmt = stmt.where(CVE.published_at <= published_before)
 
@@ -164,7 +166,9 @@ class Query:
                     id=row.id,
                     summary=row.summary,
                     severity=row.severity,
-                    cvss_score=float(row.cvss_score) if row.cvss_score is not None else None,
+                    cvss_score=float(row.cvss_score)
+                    if row.cvss_score is not None
+                    else None,
                     published_at=row.published_at,
                     updated_at=row.updated_at,
                     description=row.description,

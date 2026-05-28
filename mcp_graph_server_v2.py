@@ -1,6 +1,6 @@
 import sys
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional,Tuple
 
 from mcp.server.fastmcp import FastMCP
 from strawberry.extensions import SchemaExtension
@@ -151,7 +151,7 @@ def get_security_schema() -> dict:
                 "filters": {
                     "severity": {
                         "type": "string",
-                        "operators": ["eq", "in"],
+                        "operators": ["in"],
                         "allowedValues": ["LOW", "MEDIUM", "HIGH", "CRITICAL"],
                     },
                     "cvssScore": {
@@ -307,25 +307,28 @@ def validate_field_paths(entity: str, fields: List[str]) -> List[str]:
 
     return valid_fields
 
-def build_filters_arguments(filters: Dict[str, Any]) -> (str, Dict[str, Any]):
+
+def build_filters_arguments(
+    filters: Dict[str, Any],
+) -> (str, Dict[str, Any], Dict[str, str]):
     """
-    Given a filters dict like:
-      { "environment": "prod", "tags.name": "auth", "severity": "CRITICAL" }
-    build:
+    Build:
       - GraphQL argument string
       - variables map
-
-    For now this is deliberately simple and maps all filters to variables.
-    You can refine per-entity later.
+      - variable type map
     """
+
     arg_lines = []
     variables: Dict[str, Any] = {}
+    variable_types: Dict[str, str] = {}
+
+    SUPPORTED_RELATION_FILTERS = {
+        "tags.name": "tags",
+    }
 
     for key, value in filters.items():
-        SUPPORTED_RELATION_FILTERS = {
-            "tags.name": "tags",
-        }
 
+        # Skip unsupported nested relation filters
         if "." in key and key not in SUPPORTED_RELATION_FILTERS:
             print(
                 f"Skipping unsupported nested filter: {key}",
@@ -333,29 +336,67 @@ def build_filters_arguments(filters: Dict[str, Any]) -> (str, Dict[str, Any]):
             )
             continue
 
-        # Special handling for relation filters
         gql_arg_name = key
 
+        #
+        # Special relation handling
+        #
         if key == "tags.name":
             gql_arg_name = "tags"
 
-            # resolver expects List[str]
             if not isinstance(value, list):
                 value = [value]
 
-        var_name = gql_arg_name.replace(".", "_")
+        #
+        # Handle operator objects
+        #
+        if isinstance(value, dict):
 
+            #
+            # Handle:
+            # { "severity": { "in": [...] } }
+            #
+            if "in" in value:
+
+                #
+                # Map singular filter -> GraphQL plural argument
+                #
+                IN_FILTER_ARG_MAP = {
+                    "severity": "severities",
+                    "tag": "tags",
+                }
+
+                gql_arg_name = IN_FILTER_ARG_MAP.get(
+                    gql_arg_name,
+                    f"{gql_arg_name}s",
+                )
+
+                value = value["in"]
+
+        #
+        # Variable name derived from FINAL gql arg name
+        #
+        var_name = gql_arg_name.replace(".", "_")
         arg_lines.append(f"{gql_arg_name}: ${var_name}")
         variables[var_name] = value
 
+        #
+        # Infer GraphQL variable type
+        #
+        if isinstance(value, list):
+            variable_types[var_name] = "[String!]"
+        elif isinstance(value, bool):
+            variable_types[var_name] = "Boolean"
+        elif isinstance(value, int):
+            variable_types[var_name] = "Int"
+        elif isinstance(value, float):
+            variable_types[var_name] = "Float"
+        else:
+            variable_types[var_name] = "String"
+
     arg_str = ", ".join(arg_lines)
-    return arg_str, variables
 
-from typing import Any, Dict, List, Optional, Union
-import sys
-import json
-
-
+    return arg_str, variables, variable_types
 
 
 @mcp.tool()
@@ -374,7 +415,7 @@ def query_security_graph(
       Examples:
         { "environment": "prod", "publiclyExposed": true }
         { "tags.name": "auth" }
-        { "severity": "CRITICAL" }
+        { "severity": ["CRITICAL"] }
     - fields: Fields to return. Supports nested paths:
         "name", "environment"
         "tags.name", "tags.category"
@@ -399,57 +440,24 @@ def query_security_graph(
         selection = build_selection_for_entity(entity, fields)
         print("selection", selection, file=sys.stderr)
 
-        # Build filter arguments and variable definitions
-        filters_arg_str, filter_vars = build_filters_arguments(filters)
+        # Build filter arguments + variables + GraphQL variable types
+        filters_arg_str, filter_vars, variable_types = build_filters_arguments(filters)
+
         print("filters_arg_str", filters_arg_str, file=sys.stderr)
         print("filter_vars", filter_vars, file=sys.stderr)
+        print("variable_types", variable_types, file=sys.stderr)
 
         # Limit argument
         filters_with_limit = (
-            f"{filters_arg_str}, limit: $limit" if filters_arg_str else "limit: $limit"
+            f"{filters_arg_str}, limit: $limit"
+            if filters_arg_str
+            else "limit: $limit"
         )
 
-        # Build variable definitions for GraphQL
-        # For simplicity, treat all filter variables as String; you can refine types later.
-        # filter_var_defs = " ".join(
-        #     [f"${name}: String" for name in filter_vars.keys()]
-        # )
-        # if filter_var_defs:
-        #     filter_var_defs = " " + filter_var_defs
-
-        #openai
-        # Build variable definitions using schema filter types
-
-        TYPE_MAP = {
-            "string": "String",
-            "boolean": "Boolean",
-            "number": "Float",
-            "datetime": "DateTime",
-        }
-
-        schema_data = get_security_schema()
-        entity_schema = schema_data["entities"][entity]
-
+        # Build GraphQL variable definitions
         variable_defs = []
 
-        for field_name in filters.keys():
-
-            # Special relation filter handling
-            if field_name == "tags.name":
-                variable_defs.append("$tags: [String!]")
-                continue
-
-            filter_meta = entity_schema["filters"].get(field_name)
-
-            if not filter_meta:
-                continue
-
-            schema_type = filter_meta.get("type", "string")
-
-            gql_type = TYPE_MAP.get(schema_type, "String")
-
-            var_name = field_name.replace(".", "_")
-
+        for var_name, gql_type in variable_types.items():
             variable_defs.append(f"${var_name}: {gql_type}")
 
         filter_var_defs = ", ".join(variable_defs)
