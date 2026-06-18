@@ -192,8 +192,8 @@ The REST API exposes similar functionality for listing CVEs and container assets
 .
 ├── graph.py                 # GraphQL server (FastAPI + Strawberry)
 ├── rest.py                  # REST API server (FastAPI)
-├── mcp_graph_server.py      # MCP server wrapping the GraphQL API
-├── mcp_rest_server.py       # MCP server wrapping the REST API
+├── mcp_graph_server_v2.py   # MCP server wrapping the GraphQL API (mcp_graph_server_v1.py = older)
+├── mcp_generic_server.py    # MCP server wrapping the REST API
 ├── models.py                # SQLAlchemy models (CVE, container assets, etc.)
 ├── schema.py                # GraphQL schema & resolvers
 ├── seed_data_cve.py         # Seed script: CVEs
@@ -241,13 +241,13 @@ Install `fastmcp` for the Python MCP servers:
 pip install fastmcp httpx
 ```
 
-This is used by `mcp_graph_server.py` and `mcp_rest_server.py` to expose dedicated MCP tools over stdio or HTTP.
+This is used by `mcp_graph_server_v2.py` and `mcp_generic_server.py` to expose dedicated MCP tools over stdio or HTTP.
 
 ---
 
 ## 10. Claude MCP Configuration
 
-Run the mcp_rest_server.py , mcp_graph_server_v2.py 
+Run the mcp_generic_server.py , mcp_graph_server_v2.py 
 ```
   run in stdio for claude integration
   mcp.run(transport="stdio")
@@ -269,9 +269,9 @@ For REST:
 
 ```json
 "mcpServers": {
-    "graph-mcp": {
+    "rest-mcp": {
       "command": "python",
-      "args": ["/projectfolder/mcp_rest_server.py"]
+      "args": ["/projectfolder/mcp_generic_server.py"]
     }
   }
 ```
@@ -306,7 +306,7 @@ Instead of the generic GraphQL MCP, you can run first-class MCP servers that exp
 Graph integration:
 
 ```bash
-python mcp_graph_server.py
+python mcp_graph_server_v2.py
 ```
 
 REST integration:

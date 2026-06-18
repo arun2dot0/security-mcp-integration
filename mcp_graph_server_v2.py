@@ -94,28 +94,6 @@ def get_security_schema() -> dict:
                     },
                 },
             },
-            "Service": {
-                "fields": {
-                    "id": "string",
-                    "name": "string",
-                    "namespace": "string",
-                    "environment": "string",
-                },
-                "relations": {
-                    "containers": "ContainerAsset[]",
-                },
-                "filters": {
-                    "environment": {
-                        "type": "string",
-                        "operators": ["eq", "in"],
-                        "allowedValues": ["dev", "staging", "prod"],
-                    },
-                    "name": {
-                        "type": "string",
-                        "operators": ["eq", "contains"],
-                    },
-                },
-            },
             "Tag": {
                 "fields": {
                     "id": "string",
@@ -190,7 +168,6 @@ def get_security_schema() -> dict:
 # You can refine this mapping based on your GraphQL schema
 ENTITY_TO_ROOT_FIELD = {
     "ContainerAsset": "containerAssets",
-    "Service": "services",
     "Tag": "assetTags",
     "CVE": "cves",
     "Remediation": "remediations",
@@ -348,30 +325,22 @@ def build_filters_arguments(
                 value = [value]
 
         #
-        # Handle operator objects
+        # Normalize operator objects: { "severity": { "in": [...] } } -> list
         #
-        if isinstance(value, dict):
+        if isinstance(value, dict) and "in" in value:
+            value = value["in"]
 
-            #
-            # Handle:
-            # { "severity": { "in": [...] } }
-            #
-            if "in" in value:
-
-                #
-                # Map singular filter -> GraphQL plural argument
-                #
-                IN_FILTER_ARG_MAP = {
-                    "severity": "severities",
-                    "tag": "tags",
-                }
-
-                gql_arg_name = IN_FILTER_ARG_MAP.get(
-                    gql_arg_name,
-                    f"{gql_arg_name}s",
-                )
-
-                value = value["in"]
+        #
+        # Map singular filter keys to their GraphQL list argument whenever the
+        # value is a list, whether it arrived as { "in": [...] } or as a bare
+        # list like { "severity": ["CRITICAL"] }.
+        #
+        if isinstance(value, list):
+            IN_FILTER_ARG_MAP = {
+                "severity": "severities",
+                "tag": "tags",
+            }
+            gql_arg_name = IN_FILTER_ARG_MAP.get(gql_arg_name, gql_arg_name)
 
         #
         # Variable name derived from FINAL gql arg name
