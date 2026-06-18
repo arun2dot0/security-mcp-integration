@@ -27,7 +27,7 @@ podman volume create pg-data
 
 podman run -d --name my-postgres -p 5432:5432 \
   -e POSTGRES_PASSWORD=vulns \
-  -v yourfolder/pg-data:/var/lib/postgresql/data:Z \
+  -v /pg-data:/var/lib/postgresql/data:Z \
   docker.io/library/postgres:16
 
 podman exec -it my-postgres psql -U postgres
@@ -312,7 +312,7 @@ python mcp_graph_server.py
 REST integration:
 
 ```bash
-python mcp_rest_server.py
+python mcp_generic_server.py
 ```
 
 These wrap the GraphQL and REST APIs respectively and provide tools like `getcontainerassets`, `getcves`, `listcontainerassets`, and `listcves`.
