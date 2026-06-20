@@ -1,4 +1,3 @@
-from fastapi import FastAPI, Depends, Query
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy import create_engine, select
 from typing import Optional
@@ -10,15 +9,8 @@ DATABASE_URL = "postgresql+psycopg2://postgres:vulns@localhost:5432/postgres"
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-app = FastAPI(title="Security Rest API")
 mcp = FastMCP("Security Rest API", host="127.0.0.1", port=8001)
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 def serialize_cve(c):
     return {
@@ -55,115 +47,19 @@ def serialize_remediation(r):
         "updated_at": r.updated_at,
     }
 
-def get_tags_for_asset(db: Session, asset_id: int):
-    rows = (
-        db.execute(
-            select(AssetTag)
-            .join(container_asset_tags, container_asset_tags.c.tag_id == AssetTag.id)
-            .where(container_asset_tags.c.container_id == asset_id)
-        )
-        .scalars()
-        .all()
-    )
-    return [serialize_tag(t) for t in rows]
-
-def get_remediation_for_cve(db: Session, cve_id: str):
-    row = db.execute(
-        select(Remediation).where(Remediation.cve_id == cve_id)
-    ).scalars().first()
-    return serialize_remediation(row) if row else None
-
-@app.get("/api/v1/container-assets")
-def list_container_assets_http(
-    publicly_exposed: Optional[bool] = None,
-    runs_as_root: Optional[bool] = None,
-    limit: int = Query(20, ge=1, le=100),
-    db: Session = Depends(get_db),
-):
-    stmt = select(ContainerAsset)
-    if publicly_exposed is not None:
-        stmt = stmt.where(ContainerAsset.publicly_exposed == publicly_exposed)
-    if runs_as_root is not None:
-        stmt = stmt.where(ContainerAsset.runs_as_root == runs_as_root)
-
-    rows = db.execute(stmt.limit(limit)).unique().scalars().all()
-    return [
-        {
-            "id": row.id,
-            "name": row.name,
-            "image": row.image,
-            "registry": row.registry,
-            "environment": row.environment,
-            "namespace": row.namespace,
-            "service_name": row.service_name,
-            "publicly_exposed": row.publicly_exposed,
-            "runs_as_root": row.runs_as_root,
-            "created_at": row.created_at,
-            "updated_at": row.updated_at,
-            "tags": get_tags_for_asset(db, row.id),
-            "cves": [serialize_cve(c) for c in row.cves],
-        }
-        for row in rows
-    ]
-
-@app.get("/api/v1/container-assets/{asset_id}/tags")
-def list_asset_tags_http(asset_id: int, db: Session = Depends(get_db)):
-    return get_tags_for_asset(db, asset_id)
-
-@app.get("/api/v1/container-assets/{asset_id}/remediations")
-def list_asset_remediations_http(asset_id: int, db: Session = Depends(get_db)):
-    row = db.get(ContainerAsset, asset_id)
-    if not row:
-        return []
-    result = []
-    for c in row.cves:
-        rem = get_remediation_for_cve(db, c.id)
-        if rem:
-            result.append(rem)
-    return result
-
-@app.get("/api/v1/cves")
-def list_cves_http(
-    severity: Optional[str] = None,
-    limit: int = Query(20, ge=1, le=100),
-    db: Session = Depends(get_db),
-):
-    stmt = select(CVE)
-    if severity is not None:
-        stmt = stmt.where(CVE.severity == severity.upper())
-
-    rows = db.execute(stmt.limit(limit)).scalars().all()
-    return [serialize_cve(c) for c in rows]
-
-@app.get("/api/v1/cves/{cve_id}")
-def get_cve_http(cve_id: str, db: Session = Depends(get_db)):
-    row = db.get(CVE, cve_id)
-    if not row:
-        return None
-    payload = serialize_cve(row)
-    payload["remediation"] = get_remediation_for_cve(db, cve_id)
-    return payload
-
-@app.get("/api/v1/asset-tags")
-def list_asset_tags_http(limit: int = Query(100, ge=1, le=500), db: Session = Depends(get_db)):
-    rows = db.execute(select(AssetTag).limit(limit)).scalars().all()
-    return [serialize_tag(t) for t in rows]
-
-@app.get("/api/v1/remediations")
-def list_remediations_http(
-    priority: Optional[str] = None,
-    limit: int = Query(100, ge=1, le=500),
-    db: Session = Depends(get_db),
-):
-    stmt = select(Remediation)
-    if priority is not None:
-        stmt = stmt.where(Remediation.priority == priority.upper())
-    rows = db.execute(stmt.limit(limit)).scalars().all()
-    return [serialize_remediation(r) for r in rows]
-
-@app.get("/api/v1/remediations/{cve_id}")
-def get_remediation_http(cve_id: str, db: Session = Depends(get_db)):
-    return get_remediation_for_cve(db, cve_id)
+def get_tags_for_assets(db: Session, asset_ids):
+    """Load tags for many assets in a single query, grouped by asset id."""
+    if not asset_ids:
+        return {}
+    rows = db.execute(
+        select(container_asset_tags.c.container_id, AssetTag)
+        .join(AssetTag, container_asset_tags.c.tag_id == AssetTag.id)
+        .where(container_asset_tags.c.container_id.in_(asset_ids))
+    ).all()
+    grouped: dict = {aid: [] for aid in asset_ids}
+    for container_id, tag in rows:
+        grouped.setdefault(container_id, []).append(serialize_tag(tag))
+    return grouped
 
 @mcp.tool()
 def list_container_assets(
@@ -185,13 +81,20 @@ def list_container_assets(
     """
     db = SessionLocal()
     try:
-        stmt = select(ContainerAsset)
+        # Limit a subquery of asset IDs first. `cves` is lazy="joined", so
+        # limiting the main query directly would cut across the JOIN-expanded
+        # rows and return fewer than `limit` distinct assets.
+        id_stmt = select(ContainerAsset.id)
         if publicly_exposed is not None:
-            stmt = stmt.where(ContainerAsset.publicly_exposed == publicly_exposed)
+            id_stmt = id_stmt.where(ContainerAsset.publicly_exposed == publicly_exposed)
         if runs_as_root is not None:
-            stmt = stmt.where(ContainerAsset.runs_as_root == runs_as_root)
+            id_stmt = id_stmt.where(ContainerAsset.runs_as_root == runs_as_root)
+        id_stmt = id_stmt.limit(limit)
 
-        rows = db.execute(stmt.limit(limit)).unique().scalars().all()
+        stmt = select(ContainerAsset).where(ContainerAsset.id.in_(id_stmt))
+        rows = db.execute(stmt).unique().scalars().all()
+
+        tags_by_asset = get_tags_for_assets(db, [row.id for row in rows])
         return [
             {
                 "id": row.id,
@@ -205,7 +108,7 @@ def list_container_assets(
                 "runs_as_root": row.runs_as_root,
                 "created_at": row.created_at,
                 "updated_at": row.updated_at,
-                "tags": get_tags_for_asset(db, row.id),
+                "tags": tags_by_asset.get(row.id, []),
                 "cves": [serialize_cve(c) for c in row.cves],
             }
             for row in rows

@@ -2,7 +2,7 @@ import sys
 import json
 import logging
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import strawberry
 from strawberry.extensions import SchemaExtension
@@ -58,6 +58,33 @@ class RemediationType:
     updated_at: Optional[datetime]
 
 
+def _remediation_to_type(row) -> Optional[RemediationType]:
+    if not row:
+        return None
+    return RemediationType(
+        id=row.id,
+        cve_id=row.cve_id,
+        title=row.title,
+        priority=row.priority,
+        summary=row.summary,
+        fix_steps=row.fix_steps,
+        vendor_references=row.vendor_references,
+        estimated_effort=row.estimated_effort,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _remediations_by_cve(session, cve_ids):
+    """Load remediations for many CVEs in a single query, keyed by cve_id."""
+    if not cve_ids:
+        return {}
+    rows = session.execute(
+        select(Remediation).where(Remediation.cve_id.in_(cve_ids))
+    ).scalars().all()
+    return {r.cve_id: r for r in rows}
+
+
 @strawberry.type
 class CVEType:
     id: str
@@ -68,6 +95,11 @@ class CVEType:
     updated_at: Optional[datetime]
     description: Optional[str]
     raw_data: Optional[JSON]
+    # Optional pre-fetched remediation so a list of CVEs doesn't trigger one
+    # query (and one new session) per CVE. When `remediation_prefetched` is
+    # False the field falls back to a direct lookup.
+    preloaded_remediation: strawberry.Private[Any] = None
+    remediation_prefetched: strawberry.Private[bool] = False
 
     @strawberry.field
     def references(self) -> JSON:
@@ -75,26 +107,13 @@ class CVEType:
 
     @strawberry.field
     def remediation(self) -> Optional[RemediationType]:
+        if self.remediation_prefetched:
+            return _remediation_to_type(self.preloaded_remediation)
         with SessionLocal() as session:
             row = session.execute(
                 select(Remediation).where(Remediation.cve_id == self.id)
             ).scalars().first()
-
-            if not row:
-                return None
-
-            return RemediationType(
-                id=row.id,
-                cve_id=row.cve_id,
-                title=row.title,
-                priority=row.priority,
-                summary=row.summary,
-                fix_steps=row.fix_steps,
-                vendor_references=row.vendor_references,
-                estimated_effort=row.estimated_effort,
-                created_at=row.created_at,
-                updated_at=row.updated_at,
-            )
+            return _remediation_to_type(row)
 
 
 def get_tags_for_asset(session, asset_id: int) -> List[AssetTagType]:
@@ -118,6 +137,30 @@ def get_tags_for_asset(session, asset_id: int) -> List[AssetTagType]:
         )
         for row in rows
     ]
+
+
+def get_tags_for_assets(session, asset_ids) -> dict:
+    """Load tags for many assets in a single query, grouped by asset id."""
+    if not asset_ids:
+        return {}
+    rows = session.execute(
+        select(container_asset_tags.c.container_id, AssetTag)
+        .join(AssetTag, container_asset_tags.c.tag_id == AssetTag.id)
+        .where(container_asset_tags.c.container_id.in_(asset_ids))
+    ).all()
+
+    grouped: dict = {}
+    for container_id, tag in rows:
+        grouped.setdefault(container_id, []).append(
+            AssetTagType(
+                id=tag.id,
+                name=tag.name,
+                category=tag.category,
+                description=tag.description,
+                created_at=tag.created_at,
+            )
+        )
+    return grouped
 
 
 @strawberry.type
@@ -161,6 +204,8 @@ class Query:
 
             rows = session.execute(stmt.limit(limit)).scalars().all()
 
+            rem_by_cve = _remediations_by_cve(session, [row.id for row in rows])
+
             return [
                 CVEType(
                     id=row.id,
@@ -173,6 +218,8 @@ class Query:
                     updated_at=row.updated_at,
                     description=row.description,
                     raw_data=row.raw_data,
+                    preloaded_remediation=rem_by_cve.get(row.id),
+                    remediation_prefetched=True,
                 )
                 for row in rows
             ]
@@ -184,6 +231,10 @@ class Query:
             if not row:
                 return None
 
+            rem = session.execute(
+                select(Remediation).where(Remediation.cve_id == row.id)
+            ).scalars().first()
+
             return CVEType(
                 id=row.id,
                 summary=row.summary,
@@ -193,6 +244,8 @@ class Query:
                 updated_at=row.updated_at,
                 description=row.description,
                 raw_data=row.raw_data,
+                preloaded_remediation=rem,
+                remediation_prefetched=True,
             )
 
     @strawberry.field
@@ -209,28 +262,30 @@ class Query:
         limit: int = 20,
     ) -> List[ContainerAssetType]:
         with SessionLocal() as session:
-            stmt = select(ContainerAsset)
+            # Select the matching asset IDs first and limit *that*. Limiting the
+            # main query directly is wrong here: `cves` is lazy="joined", so the
+            # query fans out one row per asset/CVE pair and LIMIT would cut across
+            # those rows, yielding fewer than `limit` distinct assets.
+            id_stmt = select(ContainerAsset.id)
             if environment:
-                stmt = stmt.where(ContainerAsset.environment == environment)
-
+                id_stmt = id_stmt.where(ContainerAsset.environment == environment)
             if namespace:
-                stmt = stmt.where(ContainerAsset.namespace == namespace)
+                id_stmt = id_stmt.where(ContainerAsset.namespace == namespace)
             if created_after:
-                stmt = stmt.where(ContainerAsset.created_at >= created_after)
-
+                id_stmt = id_stmt.where(ContainerAsset.created_at >= created_after)
             if created_before:
-                stmt = stmt.where(ContainerAsset.created_at <= created_before)
+                id_stmt = id_stmt.where(ContainerAsset.created_at <= created_before)
             if service_name:
-                stmt = stmt.where(ContainerAsset.service_name == service_name)
+                id_stmt = id_stmt.where(ContainerAsset.service_name == service_name)
             if publicly_exposed is not None:
-                stmt = stmt.where(ContainerAsset.publicly_exposed == publicly_exposed)
+                id_stmt = id_stmt.where(ContainerAsset.publicly_exposed == publicly_exposed)
             if runs_as_root is not None:
-                stmt = stmt.where(ContainerAsset.runs_as_root == runs_as_root)
+                id_stmt = id_stmt.where(ContainerAsset.runs_as_root == runs_as_root)
 
             # Filter by tag names if provided
             if tags:
-                stmt = (
-                    stmt.join(
+                id_stmt = (
+                    id_stmt.join(
                         container_asset_tags,
                         ContainerAsset.id == container_asset_tags.c.container_id,
                     )
@@ -242,8 +297,12 @@ class Query:
                     .distinct()
                 )
 
-            result = session.execute(stmt.limit(limit))
-            rows = result.unique().scalars().all()
+            id_stmt = id_stmt.limit(limit)
+
+            stmt = select(ContainerAsset).where(ContainerAsset.id.in_(id_stmt))
+            rows = session.execute(stmt).unique().scalars().all()
+
+            tags_by_asset = get_tags_for_assets(session, [row.id for row in rows])
 
             return [
                 ContainerAssetType(
@@ -273,7 +332,7 @@ class Query:
                         )
                         for cve in row.cves
                     ],
-                    tags=get_tags_for_asset(session, row.id),
+                    tags=tags_by_asset.get(row.id, []),
                 )
                 for row in rows
             ]
