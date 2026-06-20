@@ -58,12 +58,12 @@ def _security_schema() -> dict:
                     # exact match
                     "environment": {
                         "type": "string",
-                        "operators": ["eq", "in"],
+                        "operators": ["eq"],
                         "allowedValues": ["dev", "staging", "prod"],
                     },
                     "namespace": {
                         "type": "string",
-                        "operators": ["eq", "in"],
+                        "operators": ["eq"],
                     },
                     "serviceName": {
                         "type": "string",
