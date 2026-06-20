@@ -1,9 +1,9 @@
 import sys
 import json
+from functools import lru_cache
 from typing import Any, Dict, List, Optional,Tuple
 
 from mcp.server.fastmcp import FastMCP
-from strawberry.extensions import SchemaExtension
 
 from schema import schema
 
@@ -11,27 +11,11 @@ from schema import schema
 mcp = FastMCP("Security API GraphQL", host="127.0.0.1", port=8000)
 
 
-class ClaudeQueryLogger(SchemaExtension):
-    """Log each GraphQL query executed through the schema."""
-
-    def on_execute(self):
-        execution_context = self.execution_context
-        print("\n" + "═" * 60, file=sys.stderr)
-        print("📥 RAW GRAPHQL RECEIVED FROM LLM:", file=sys.stderr)
-        print(execution_context.query, file=sys.stderr)
-        if execution_context.variables:
-            print(
-                f"Variables: {json.dumps(execution_context.variables, indent=2)}",
-                file=sys.stderr,
-            )
-        print("═" * 60 + "\n", file=sys.stderr)
-        sys.stderr.flush()
-        yield
-
-
 def execute_gql_with_logging(gql_query: str, variables: dict):
-    # schema already has ClaudeQueryLogger attached in schema.py
-    print("gql_query ",gql_query)
+    # schema already has ClaudeQueryLogger attached in schema.py.
+    # NOTE: must log to stderr — any stdout write corrupts the JSON-RPC stream
+    # when running under transport="stdio".
+    print("gql_query ", gql_query, file=sys.stderr)
     return schema.execute_sync(gql_query, variable_values=variables)
 
 
@@ -45,6 +29,11 @@ def get_security_schema() -> dict:
     entities, fields, relationships, and filter capabilities.
     """
     print("call get_security_schema", file=sys.stderr)
+    return _security_schema()
+
+
+@lru_cache(maxsize=1)
+def _security_schema() -> dict:
     return {
         "entities": {
             "ContainerAsset": {
@@ -69,16 +58,16 @@ def get_security_schema() -> dict:
                     # exact match
                     "environment": {
                         "type": "string",
-                        "operators": ["eq", "in"],
+                        "operators": ["eq"],
                         "allowedValues": ["dev", "staging", "prod"],
                     },
                     "namespace": {
                         "type": "string",
-                        "operators": ["eq", "in"],
+                        "operators": ["eq"],
                     },
                     "serviceName": {
                         "type": "string",
-                        "operators": ["eq", "contains"],
+                        "operators": ["eq"],
                     },
                     "publiclyExposed": {
                         "type": "boolean",
@@ -90,7 +79,7 @@ def get_security_schema() -> dict:
                     },
                     "createdAt": {
                         "type": "datetime",
-                        "operators": ["before", "after", "between"],
+                        "operators": ["before", "after"],
                     },
                 },
             },
@@ -101,17 +90,9 @@ def get_security_schema() -> dict:
                     "category": "string",
                     "description": "string",
                 },
-                "filters": {
-                    "name": {
-                        "type": "string",
-                        "operators": ["eq", "in"],
-                    },
-                    "category": {
-                        "type": "string",
-                        "operators": ["eq", "in"],
-                        "allowedValues": ["compliance", "auth", "network"],
-                    },
-                },
+                # The root assetTags query takes no filters. To filter by tag,
+                # query ContainerAsset with the "tags.name" relation filter.
+                "filters": {},
             },
             "CVE": {
                 "fields": {
@@ -124,21 +105,17 @@ def get_security_schema() -> dict:
                     "description": "string",
                 },
                 "relations": {
-                    "remediation": "Remediation[]",
+                    "remediation": "Remediation",
                 },
                 "filters": {
                     "severity": {
                         "type": "string",
-                        "operators": ["in"],
+                        "operators": ["eq", "in"],
                         "allowedValues": ["LOW", "MEDIUM", "HIGH", "CRITICAL"],
-                    },
-                    "cvssScore": {
-                        "type": "number",
-                        "operators": ["gt", "gte", "lt", "lte", "between"],
                     },
                     "publishedAt": {
                         "type": "datetime",
-                        "operators": ["before", "after", "between"],
+                        "operators": ["before", "after"],
                     },
                 },
             },
@@ -154,7 +131,7 @@ def get_security_schema() -> dict:
                 "filters": {
                     "priority": {
                         "type": "string",
-                        "operators": ["eq", "in"],
+                        "operators": ["eq"],
                         "allowedValues": ["LOW", "MEDIUM", "HIGH"],
                     },
                 },
@@ -218,7 +195,7 @@ def build_selection_for_entity(
     return "\n".join(render(tree))
 
 def get_entity_relations():
-    schema_data = get_security_schema()
+    schema_data = _security_schema()
     entities = schema_data["entities"]
 
     relation_map = {}
@@ -234,7 +211,7 @@ def validate_field_paths(entity: str, fields: List[str]) -> List[str]:
     Remove invalid recursive/nonsensical field paths.
     """
 
-    schema_data = get_security_schema()
+    schema_data = _security_schema()
     entities = schema_data["entities"]
 
     valid_fields = []
@@ -299,69 +276,112 @@ def build_filters_arguments(
     variables: Dict[str, Any] = {}
     variable_types: Dict[str, str] = {}
 
+    # Relation filters that map onto a root-query argument.
     SUPPORTED_RELATION_FILTERS = {
         "tags.name": "tags",
     }
+    # Singular filter keys whose GraphQL argument is a list. The value is always
+    # coerced to a list, whether it arrived as a scalar, { "in": [...] }, or a
+    # bare list like ["CRITICAL"].
+    LIST_ARG_MAP = {
+        "severity": "severities",
+        "tag": "tags",
+        "tags.name": "tags",
+    }
+    # Datetime range filters expressed as operator objects, e.g.
+    # { "publishedAt": { "after": "2025-01-01" } }. These map onto the resolver's
+    # separate <base>After / <base>Before arguments.
+    DATE_RANGE_BASE = {
+        "publishedAt": "published",
+        "createdAt": "created",
+    }
+
+    def infer_type(value: Any) -> str:
+        if isinstance(value, list):
+            if value and all(isinstance(v, bool) for v in value):
+                elem = "Boolean"
+            elif value and all(isinstance(v, bool) is False and isinstance(v, int) for v in value):
+                elem = "Int"
+            elif value and all(isinstance(v, (int, float)) for v in value):
+                elem = "Float"
+            else:
+                elem = "String"
+            return f"[{elem}!]"
+        # bool must be checked before int (bool is a subclass of int)
+        if isinstance(value, bool):
+            return "Boolean"
+        if isinstance(value, int):
+            return "Int"
+        if isinstance(value, float):
+            return "Float"
+        return "String"
+
+    def add_var(gql_arg_name: str, value: Any, gql_type: str) -> None:
+        arg_lines.append(f"{gql_arg_name}: ${gql_arg_name}")
+        variables[gql_arg_name] = value
+        variable_types[gql_arg_name] = gql_type
 
     for key, value in filters.items():
 
-        # Skip unsupported nested relation filters
+        # Skip unsupported nested relation filters (only tags.name is wired up).
         if "." in key and key not in SUPPORTED_RELATION_FILTERS:
-            print(
-                f"Skipping unsupported nested filter: {key}",
-                file=sys.stderr,
-            )
+            print(f"Skipping unsupported nested filter: {key}", file=sys.stderr)
             continue
+
+        #
+        # Datetime range filters -> separate <base>After / <base>Before args.
+        #
+        if key in DATE_RANGE_BASE:
+            base = DATE_RANGE_BASE[key]
+            if not isinstance(value, dict):
+                print(
+                    f"Skipping {key}: expected an operator object like "
+                    f'{{"after": ...}} / {{"before": ...}}',
+                    file=sys.stderr,
+                )
+                continue
+            if "after" in value:
+                add_var(f"{base}After", value["after"], "DateTime")
+            if "before" in value:
+                add_var(f"{base}Before", value["before"], "DateTime")
+            for op in value:
+                if op not in ("after", "before"):
+                    print(
+                        f"Skipping unsupported operator '{op}' on {key} "
+                        f"(only after/before resolve)",
+                        file=sys.stderr,
+                    )
+            continue
+
+        #
+        # Normalize operator objects. Only "in" and "eq" map onto resolver
+        # arguments; range/text operators (gt, lt, contains, between, ...) have
+        # no resolver support, so skip rather than emit a query that errors.
+        #
+        if isinstance(value, dict):
+            if "in" in value:
+                value = value["in"]
+            elif "eq" in value:
+                value = value["eq"]
+            else:
+                print(
+                    f"Skipping unsupported operator object on '{key}': {value}",
+                    file=sys.stderr,
+                )
+                continue
 
         gql_arg_name = key
 
         #
-        # Special relation handling
+        # Coerce list-valued arguments. The value is forced to a list so a scalar
+        # like { "severity": "CRITICAL" } still maps to severities: ["CRITICAL"].
         #
-        if key == "tags.name":
-            gql_arg_name = "tags"
-
+        if gql_arg_name in LIST_ARG_MAP:
+            gql_arg_name = LIST_ARG_MAP[gql_arg_name]
             if not isinstance(value, list):
                 value = [value]
 
-        #
-        # Normalize operator objects: { "severity": { "in": [...] } } -> list
-        #
-        if isinstance(value, dict) and "in" in value:
-            value = value["in"]
-
-        #
-        # Map singular filter keys to their GraphQL list argument whenever the
-        # value is a list, whether it arrived as { "in": [...] } or as a bare
-        # list like { "severity": ["CRITICAL"] }.
-        #
-        if isinstance(value, list):
-            IN_FILTER_ARG_MAP = {
-                "severity": "severities",
-                "tag": "tags",
-            }
-            gql_arg_name = IN_FILTER_ARG_MAP.get(gql_arg_name, gql_arg_name)
-
-        #
-        # Variable name derived from FINAL gql arg name
-        #
-        var_name = gql_arg_name.replace(".", "_")
-        arg_lines.append(f"{gql_arg_name}: ${var_name}")
-        variables[var_name] = value
-
-        #
-        # Infer GraphQL variable type
-        #
-        if isinstance(value, list):
-            variable_types[var_name] = "[String!]"
-        elif isinstance(value, bool):
-            variable_types[var_name] = "Boolean"
-        elif isinstance(value, int):
-            variable_types[var_name] = "Int"
-        elif isinstance(value, float):
-            variable_types[var_name] = "Float"
-        else:
-            variable_types[var_name] = "String"
+        add_var(gql_arg_name, value, infer_type(value))
 
     arg_str = ", ".join(arg_lines)
 

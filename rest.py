@@ -116,14 +116,18 @@ def list_container_assets(
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
-    stmt = select(ContainerAsset)
+    # Limit a subquery of asset IDs first. `cves` is lazy="joined", so limiting
+    # the main query directly would cut across the JOIN-expanded rows and return
+    # fewer than `limit` distinct assets.
+    id_stmt = select(ContainerAsset.id)
     if publicly_exposed is not None:
-        stmt = stmt.where(ContainerAsset.publicly_exposed == publicly_exposed)
+        id_stmt = id_stmt.where(ContainerAsset.publicly_exposed == publicly_exposed)
     if runs_as_root is not None:
-        stmt = stmt.where(ContainerAsset.runs_as_root == runs_as_root)
+        id_stmt = id_stmt.where(ContainerAsset.runs_as_root == runs_as_root)
+    id_stmt = id_stmt.limit(limit)
 
-    result = db.execute(stmt.limit(limit)).unique()
-    rows = result.scalars().all()
+    stmt = select(ContainerAsset).where(ContainerAsset.id.in_(id_stmt))
+    rows = db.execute(stmt).unique().scalars().all()
     return [container_asset_to_dict(row, db) for row in rows]
 
 
